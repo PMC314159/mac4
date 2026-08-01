@@ -1,20 +1,18 @@
+import crypto from "node:crypto";
 import {
-  handleUpload
-} from "@vercel/blob/client";
+  DeleteObjectCommand,
+  PutObjectCommand,
+  S3Client
+} from "@aws-sdk/client-s3";
 import {
-  del
-} from "@vercel/blob";
+  getSignedUrl
+} from "@aws-sdk/s3-request-presigner";
 
-const MAX_IMAGE_SIZE =
-  60 * 1024 * 1024;
+const MAX_PACKAGE_BYTES =
+  96 * 1024 * 1024;
 
-const ALLOWED_CONTENT_TYPES = [
-  "image/jpeg",
-  "image/png",
-  "image/webp",
-  "image/gif",
-  "image/avif"
-];
+const TEMP_PREFIX =
+  "pair-archive-temp/";
 
 function sendJson(
   response,
@@ -38,34 +36,117 @@ function sendJson(
 function parseBody(request) {
   if (
     typeof request.body ===
-    "string"
+      "string"
   ) {
-    return JSON.parse(request.body);
+    return JSON.parse(
+      request.body
+    );
   }
 
   return request.body || {};
 }
 
-function isTemporaryBlobUrl(value) {
-  try {
-    const url = new URL(value);
+function requiredEnvironment() {
+  const values = {
+    accountId:
+      process.env.R2_ACCOUNT_ID,
+    accessKeyId:
+      process.env.R2_ACCESS_KEY_ID,
+    secretAccessKey:
+      process.env.R2_SECRET_ACCESS_KEY,
+    bucket:
+      process.env.R2_BUCKET_NAME
+  };
 
-    const validHost =
-      url.hostname ===
-        "public.blob.vercel-storage.com" ||
-      url.hostname.endsWith(
-        ".public.blob.vercel-storage.com"
-      );
-
-    return (
-      url.protocol === "https:" &&
-      validHost &&
-      url.pathname.includes(
-        "/pair-archive-temp/"
+  const missing =
+    Object.entries(values)
+      .filter(([, value]) =>
+        !String(value || "").trim()
       )
+      .map(([key]) => key);
+
+  if (missing.length) {
+    throw new Error(
+      "Vercel의 R2 환경변수가 완성되지 않았습니다."
     );
+  }
+
+  return values;
+}
+
+function createClient() {
+  const env =
+    requiredEnvironment();
+
+  const client = new S3Client({
+    region: "auto",
+    endpoint:
+      `https://${env.accountId}.r2.cloudflarestorage.com`,
+    credentials: {
+      accessKeyId:
+        env.accessKeyId,
+      secretAccessKey:
+        env.secretAccessKey
+    }
+  });
+
+  return {
+    client,
+    bucket: env.bucket
+  };
+}
+
+function isValidTemporaryKey(value) {
+  return (
+    typeof value === "string" &&
+    value.startsWith(
+      TEMP_PREFIX
+    ) &&
+    value.endsWith(".zip") &&
+    value.length < 240 &&
+    !value.includes("..") &&
+    !value.includes("\\")
+  );
+}
+
+function enforceSameOrigin(request) {
+  const origin =
+    request.headers.origin;
+
+  if (!origin) return;
+
+  const forwardedHost =
+    request.headers[
+      "x-forwarded-host"
+    ];
+
+  const host =
+    String(
+      forwardedHost ||
+      request.headers.host ||
+      ""
+    )
+      .split(",")[0]
+      .trim();
+
+  let originHost = "";
+
+  try {
+    originHost =
+      new URL(origin).host;
   } catch {
-    return false;
+    throw new Error(
+      "허용되지 않은 요청 출처입니다."
+    );
+  }
+
+  if (
+    !host ||
+    originHost !== host
+  ) {
+    throw new Error(
+      "현재 사이트에서 시작된 요청만 허용됩니다."
+    );
   }
 }
 
@@ -90,90 +171,91 @@ export default async function handler(
   }
 
   try {
-    if (
-      request.method === "DELETE"
-    ) {
-      const body =
-        parseBody(request);
-
-      const urls = Array.from(
-        new Set(
-          (Array.isArray(body?.urls)
-            ? body.urls
-            : []
-          ).filter(
-            isTemporaryBlobUrl
-          )
-        )
-      );
-
-      if (urls.length) {
-        await del(urls);
-      }
-
-      sendJson(response, 200, {
-        deleted: urls.length
-      });
-      return;
-    }
+    enforceSameOrigin(request);
 
     const body =
       parseBody(request);
 
-    const jsonResponse =
-      await handleUpload({
-        body,
-        request,
+    const {
+      client,
+      bucket
+    } = createClient();
 
-        onBeforeGenerateToken:
-          async (pathname) => {
-            if (
-              typeof pathname !==
-                "string" ||
-              !pathname.startsWith(
-                "pair-archive-temp/"
-              )
-            ) {
-              throw new Error(
-                "허용되지 않은 업로드 경로입니다."
-              );
-            }
+    if (
+      request.method ===
+        "DELETE"
+    ) {
+      const key = body?.key;
 
-            return {
-              allowedContentTypes:
-                ALLOWED_CONTENT_TYPES,
-              maximumSizeInBytes:
-                MAX_IMAGE_SIZE,
-              addRandomSuffix: true,
-              tokenPayload:
-                JSON.stringify({
-                  createdAt:
-                    Date.now()
-                })
-            };
-          },
+      if (
+        !isValidTemporaryKey(key)
+      ) {
+        throw new Error(
+          "삭제할 임시 패키지 경로가 올바르지 않습니다."
+        );
+      }
 
-        onUploadCompleted:
-          async ({ blob }) => {
-            console.log(
-              "Temporary pair archive image uploaded:",
-              blob.pathname
-            );
-          }
+      await client.send(
+        new DeleteObjectCommand({
+          Bucket: bucket,
+          Key: key
+        })
+      );
+
+      sendJson(response, 200, {
+        deleted: true
       });
+      return;
+    }
 
-    sendJson(
-      response,
-      200,
-      jsonResponse
-    );
+    const size =
+      Number(body?.size);
+
+    if (
+      !Number.isFinite(size) ||
+      size <= 0 ||
+      size > MAX_PACKAGE_BYTES
+    ) {
+      throw new Error(
+        "렌더 ZIP은 96MB 이하여야 합니다."
+      );
+    }
+
+    const key =
+      TEMP_PREFIX +
+      Date.now() +
+      "-" +
+      crypto.randomUUID() +
+      ".zip";
+
+    const uploadUrl =
+      await getSignedUrl(
+        client,
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: key,
+          ContentType:
+            "application/zip"
+        }),
+        {
+          expiresIn: 300
+        }
+      );
+
+    sendJson(response, 200, {
+      key,
+      uploadUrl,
+      expiresIn: 300,
+      maximumSizeInBytes:
+        MAX_PACKAGE_BYTES
+    });
   } catch (error) {
     console.error(error);
 
     sendJson(response, 400, {
       error:
         error?.message ||
-        "이미지 업로드 토큰을 생성하지 못했습니다."
+        "R2 업로드 요청을 준비하지 못했습니다."
     });
   }
 }
