@@ -20,14 +20,17 @@ function sendJson(
   body
 ) {
   response.statusCode = status;
+
   response.setHeader(
     "Content-Type",
     "application/json; charset=utf-8"
   );
+
   response.setHeader(
     "Cache-Control",
     "no-store"
   );
+
   response.end(
     JSON.stringify(body)
   );
@@ -36,7 +39,7 @@ function sendJson(
 function parseBody(request) {
   if (
     typeof request.body ===
-      "string"
+    "string"
   ) {
     return JSON.parse(
       request.body
@@ -50,10 +53,13 @@ function requiredEnvironment() {
   const values = {
     accountId:
       process.env.R2_ACCOUNT_ID,
+
     accessKeyId:
       process.env.R2_ACCESS_KEY_ID,
+
     secretAccessKey:
       process.env.R2_SECRET_ACCESS_KEY,
+
     bucket:
       process.env.R2_BUCKET_NAME
   };
@@ -80,14 +86,25 @@ function createClient() {
 
   const client = new S3Client({
     region: "auto",
+
     endpoint:
       `https://${env.accountId}.r2.cloudflarestorage.com`,
+
     credentials: {
       accessKeyId:
         env.accessKeyId,
+
       secretAccessKey:
         env.secretAccessKey
-    }
+    },
+
+    // presigned URL에 빈 파일용 CRC32 체크섬이
+    // 자동으로 들어가는 것을 방지합니다.
+    requestChecksumCalculation:
+      "WHEN_REQUIRED",
+
+    responseChecksumValidation:
+      "WHEN_REQUIRED"
   });
 
   return {
@@ -167,6 +184,7 @@ export default async function handler(
       error:
         "POST 또는 DELETE 요청만 지원합니다."
     });
+
     return;
   }
 
@@ -183,9 +201,10 @@ export default async function handler(
 
     if (
       request.method ===
-        "DELETE"
+      "DELETE"
     ) {
-      const key = body?.key;
+      const key =
+        body?.key;
 
       if (
         !isValidTemporaryKey(key)
@@ -205,6 +224,7 @@ export default async function handler(
       sendJson(response, 200, {
         deleted: true
       });
+
       return;
     }
 
@@ -231,12 +251,14 @@ export default async function handler(
     const uploadUrl =
       await getSignedUrl(
         client,
+
         new PutObjectCommand({
           Bucket: bucket,
           Key: key,
           ContentType:
             "application/zip"
         }),
+
         {
           expiresIn: 300
         }
@@ -246,6 +268,7 @@ export default async function handler(
       key,
       uploadUrl,
       expiresIn: 300,
+
       maximumSizeInBytes:
         MAX_PACKAGE_BYTES
     });
