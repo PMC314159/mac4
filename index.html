@@ -17,7 +17,7 @@
   />
   <link
     rel="stylesheet"
-    href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@100..900&display=swap"
+    href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@100..900&family=Noto+Sans+KR:wght@100..900&family=Noto+Sans+SC:wght@100..900&family=Noto+Sans+TC:wght@100..900&display=block"
   />
   <link
     rel="stylesheet"
@@ -57,6 +57,27 @@
       --deep-rgb: 27,0,46;
       --surface-rgb: 251,247,253;
       --ink-rgb: 53,41,62;
+
+      /*
+       * 한국어뿐 아니라 일본어, 간체·번체 중국어와
+       * 호환 한자까지 순서대로 대체할 수 있는 범용 CJK 폰트 스택입니다.
+       */
+      --cjk-font-stack:
+        Pretendard,
+        "Noto Sans KR",
+        "Noto Sans JP",
+        "Noto Sans SC",
+        "Noto Sans TC",
+        "Hiragino Sans",
+        "Yu Gothic",
+        Meiryo,
+        "Microsoft YaHei",
+        "Microsoft JhengHei",
+        "PingFang SC",
+        "PingFang TC",
+        "Apple SD Gothic Neo",
+        "Malgun Gothic",
+        sans-serif;
     }
 
     * {
@@ -75,7 +96,27 @@
         radial-gradient(circle at 12% 10%, rgba(174,137,194,.22), transparent 30%),
         radial-gradient(circle at 88% 8%, rgba(225,207,236,.15), transparent 26%),
         var(--editor-bg);
-      font-family: Pretendard, "Noto Sans KR", "Noto Sans CJK KR", "Malgun Gothic", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-family: var(--cjk-font-stack);
+      font-synthesis: none;
+      text-rendering: optimizeLegibility;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    /*
+     * 입력창, contenteditable, 저장 영역까지 같은 CJK 스택을 강제합니다.
+     * 일본어 조합 중 폰트가 순간적으로 바뀌거나 저장본만 네모로
+     * 표시되는 현상을 줄여 줍니다.
+     */
+    button,
+    input,
+    textarea,
+    select,
+    [contenteditable="true"],
+    #captureArea,
+    #captureArea * {
+      font-family: var(--cjk-font-stack);
+      font-synthesis: none;
     }
 
     button,
@@ -6475,7 +6516,51 @@
     }
 
     function exportFont(weight, size) {
-      return `${weight} ${size}px "Noto Sans KR", Pretendard, "Malgun Gothic", Arial, sans-serif`;
+      return `${weight} ${size}px Pretendard, "Noto Sans KR", "Noto Sans JP", "Noto Sans SC", "Noto Sans TC", "Hiragino Sans", "Yu Gothic", Meiryo, "Microsoft YaHei", "Microsoft JhengHei", "PingFang SC", "PingFang TC", "Malgun Gothic", sans-serif`;
+    }
+
+    const CJK_WEB_FONT_FAMILIES = [
+      "Noto Sans KR",
+      "Noto Sans JP",
+      "Noto Sans SC",
+      "Noto Sans TC"
+    ];
+
+    const CJK_FONT_TEST_TEXT =
+      "한글 日本語 ひらがな カタカナ 漢字 简体中文 繁體中文 " +
+      "髙﨑邊邉濵瀨德隆 々〆ヶ 𠮷";
+
+    async function ensureCjkFontsReady(root = document) {
+      if (!document.fonts) {
+        return;
+      }
+
+      const pageText = String(root?.textContent || "")
+        .replace(/\s+/g, " ")
+        .slice(0, 6000);
+
+      const sample = `${CJK_FONT_TEST_TEXT} ${pageText}`;
+      const requests = [];
+
+      for (const family of CJK_WEB_FONT_FAMILIES) {
+        requests.push(
+          document.fonts.load(
+            "400 16px '" + family + "'",
+            sample
+          ),
+          document.fonts.load(
+            "700 16px '" + family + "'",
+            sample
+          ),
+          document.fonts.load(
+            "900 16px '" + family + "'",
+            sample
+          )
+        );
+      }
+
+      await Promise.allSettled(requests);
+      await document.fonts.ready;
     }
 
     function wrapCanvasText(
@@ -8963,6 +9048,15 @@
         document.documentElement.getAttribute("style") || ""
       );
 
+      const renderFontSample = JSON.stringify(
+        `${CJK_FONT_TEST_TEXT} ${clone.textContent || ""}`
+          .replace(/\s+/g, " ")
+          .slice(0, 8000)
+      )
+        .replaceAll("<", "\\u003c")
+        .replaceAll(">", "\\u003e")
+        .replaceAll("&", "\\u0026");
+
       return `<!DOCTYPE html>
 <html lang="ko" style="${rootStyle}">
 <head>
@@ -8974,6 +9068,18 @@
   ${stylesheetLinks}
   <style>
     ${styleText}
+
+    .cjk-font-preload {
+      position: fixed !important;
+      top: -10000px !important;
+      left: -10000px !important;
+      width: 1px !important;
+      height: 1px !important;
+      overflow: hidden !important;
+      opacity: 0 !important;
+      pointer-events: none !important;
+      white-space: nowrap !important;
+    }
 
     html,
     body {
@@ -8998,7 +9104,69 @@
   </style>
 </head>
 <body>
+  <div class="cjk-font-preload" aria-hidden="true">
+    <span style="font-family:'Noto Sans KR';font-weight:400">한글 日本語 漢字 简体中文 繁體中文 髙﨑邊邉濵瀨德隆𠮷</span>
+    <span style="font-family:'Noto Sans JP';font-weight:700">日本語 ひらがな カタカナ 漢字 髙﨑邊邉濵瀨德隆𠮷</span>
+    <span style="font-family:'Noto Sans SC';font-weight:900">简体中文 漢字 髙﨑邊邉濵瀨德隆𠮷</span>
+    <span style="font-family:'Noto Sans TC';font-weight:900">繁體中文 漢字 髙﨑邊邉濵瀨德隆𠮷</span>
+  </div>
   ${clone.outerHTML}
+  <script>
+    (() => {
+      const families = [
+        "Noto Sans KR",
+        "Noto Sans JP",
+        "Noto Sans SC",
+        "Noto Sans TC"
+      ];
+
+      const sample = ${renderFontSample};
+
+      window.__PAIR_ARCHIVE_READY__ = false;
+
+      const finish = () => {
+        document.documentElement.dataset.fontsReady = "true";
+        window.__PAIR_ARCHIVE_READY__ = true;
+        window.dispatchEvent(
+          new CustomEvent("pair-archive-ready")
+        );
+      };
+
+      if (!document.fonts) {
+        finish();
+        return;
+      }
+
+      const requests = [];
+
+      for (const family of families) {
+        requests.push(
+          document.fonts.load(
+            "400 16px '" + family + "'",
+            sample
+          ),
+          document.fonts.load(
+            "700 16px '" + family + "'",
+            sample
+          ),
+          document.fonts.load(
+            "900 16px '" + family + "'",
+            sample
+          )
+        );
+      }
+
+      Promise.allSettled(requests)
+        .then(() => document.fonts.ready)
+        .then(() => new Promise((resolve) => {
+          requestAnimationFrame(() => {
+            requestAnimationFrame(resolve);
+          });
+        }))
+        .then(finish)
+        .catch(finish);
+    })();
+  <\/script>
 </body>
 </html>`;
     }
@@ -9011,9 +9179,9 @@
         els.captureArea
       );
 
-      if (document.fonts?.ready) {
-        await document.fonts.ready;
-      }
+      await ensureCjkFontsReady(
+        els.captureArea
+      );
 
       let objectKey = "";
       let renderStarted = false;
