@@ -1,7 +1,9 @@
 import {
   mkdir,
   mkdtemp,
+  readdir,
   rm,
+  stat,
   writeFile
 } from "node:fs/promises";
 import os from "node:os";
@@ -9,7 +11,6 @@ import path from "node:path";
 import {
   pathToFileURL
 } from "node:url";
-import { Readable } from "node:stream";
 import chromium from "@sparticuz/chromium";
 import {
   DeleteObjectCommand,
@@ -32,20 +33,29 @@ const MAX_UNPACKED_BYTES =
 
 const MAX_ARCHIVE_ENTRIES = 32;
 
+const TEMP_DIRECTORY_PREFIX =
+  "pair-archive-";
+
+const STALE_TEMP_MAX_AGE_MS =
+  20 * 60 * 1000;
+
 function sendJson(
   response,
   status,
   body
 ) {
   response.statusCode = status;
+
   response.setHeader(
     "Content-Type",
     "application/json; charset=utf-8"
   );
+
   response.setHeader(
     "Cache-Control",
     "no-store"
   );
+
   response.end(
     JSON.stringify(body)
   );
@@ -81,10 +91,13 @@ function requiredEnvironment() {
   const values = {
     accountId:
       process.env.R2_ACCOUNT_ID,
+
     accessKeyId:
       process.env.R2_ACCESS_KEY_ID,
+
     secretAccessKey:
       process.env.R2_SECRET_ACCESS_KEY,
+
     bucket:
       process.env.R2_BUCKET_NAME
   };
@@ -110,17 +123,90 @@ function createClient() {
   return {
     client: new S3Client({
       region: "auto",
+
       endpoint:
         `https://${env.accountId}.r2.cloudflarestorage.com`,
+
       credentials: {
         accessKeyId:
           env.accessKeyId,
+
         secretAccessKey:
           env.secretAccessKey
       }
     }),
+
     bucket: env.bucket
   };
+}
+
+async function cleanupStaleTempDirectories() {
+  const temporaryRoot =
+    os.tmpdir();
+
+  let entries = [];
+
+  try {
+    entries = await readdir(
+      temporaryRoot,
+      {
+        withFileTypes: true
+      }
+    );
+  } catch (error) {
+    console.warn(
+      "임시 폴더 목록을 확인하지 못했습니다.",
+      error
+    );
+
+    return;
+  }
+
+  const now = Date.now();
+
+  await Promise.allSettled(
+    entries
+      .filter(
+        (entry) =>
+          entry.isDirectory() &&
+          entry.name.startsWith(
+            TEMP_DIRECTORY_PREFIX
+          )
+      )
+      .map(async (entry) => {
+        const target =
+          path.join(
+            temporaryRoot,
+            entry.name
+          );
+
+        try {
+          const information =
+            await stat(target);
+
+          if (
+            now -
+              information.mtimeMs <
+            STALE_TEMP_MAX_AGE_MS
+          ) {
+            return;
+          }
+
+          await rm(
+            target,
+            {
+              recursive: true,
+              force: true
+            }
+          );
+        } catch (error) {
+          console.warn(
+            `오래된 임시 폴더를 정리하지 못했습니다: ${target}`,
+            error
+          );
+        }
+      })
+  );
 }
 
 async function bodyToUint8Array(body) {
@@ -280,7 +366,9 @@ async function extractPackage(
 
     await mkdir(
       path.dirname(destination),
-      { recursive: true }
+      {
+        recursive: true
+      }
     );
 
     await writeFile(
@@ -307,23 +395,34 @@ export default async function handler(
       "POST"
     );
 
-    sendJson(response, 405, {
-      error:
-        "POST 요청만 지원합니다."
-    });
+    sendJson(
+      response,
+      405,
+      {
+        error:
+          "POST 요청만 지원합니다."
+      }
+    );
+
     return;
   }
 
   const body =
     parseBody(request);
 
-  const key = body?.key;
+  const key =
+    body?.key;
 
   if (!isValidTemporaryKey(key)) {
-    sendJson(response, 400, {
-      error:
-        "렌더링할 임시 ZIP 경로가 올바르지 않습니다."
-    });
+    sendJson(
+      response,
+      400,
+      {
+        error:
+          "렌더링할 임시 ZIP 경로가 올바르지 않습니다."
+      }
+    );
+
     return;
   }
 
@@ -345,12 +444,20 @@ export default async function handler(
     )
   );
 
-  let browser;
+  let browser = null;
+  let page = null;
   let tempDirectory = "";
   let client = null;
   let bucket = "";
 
   try {
+    /*
+     * 이전 함수 실행이 강제 종료되어
+     * finally가 실행되지 않았을 경우 남아 있는
+     * 오래된 임시 폴더를 먼저 정리합니다.
+     */
+    await cleanupStaleTempDirectories();
+
     ({
       client,
       bucket
@@ -365,7 +472,9 @@ export default async function handler(
       );
 
     if (
-      Number(object.ContentLength || 0) >
+      Number(
+        object.ContentLength || 0
+      ) >
       MAX_PACKAGE_BYTES
     ) {
       throw new Error(
@@ -387,39 +496,177 @@ export default async function handler(
       );
     }
 
+    /*
+     * 이번 요청에서만 사용하는
+     * 고유 임시 작업 폴더를 생성합니다.
+     */
     tempDirectory =
       await mkdtemp(
         path.join(
           os.tmpdir(),
-          "pair-archive-"
+          TEMP_DIRECTORY_PREFIX
         )
       );
+
+    const siteDirectory =
+      path.join(
+        tempDirectory,
+        "site"
+      );
+
+    const chromiumProfileDirectory =
+      path.join(
+        tempDirectory,
+        "chromium-profile"
+      );
+
+    const chromiumCacheDirectory =
+      path.join(
+        tempDirectory,
+        "chromium-cache"
+      );
+
+    const chromiumConfigDirectory =
+      path.join(
+        tempDirectory,
+        "chromium-config"
+      );
+
+    const chromiumTempDirectory =
+      path.join(
+        tempDirectory,
+        "chromium-temp"
+      );
+
+    /*
+     * HTML과 이미지뿐 아니라 Chromium이 만드는
+     * 프로필, 캐시, 설정, 임시 파일까지
+     * 모두 같은 작업 폴더 안에 넣습니다.
+     *
+     * 마지막에 tempDirectory 하나만 지우면
+     * Chromium 관련 찌꺼기도 함께 삭제됩니다.
+     */
+    await Promise.all([
+      mkdir(
+        siteDirectory,
+        {
+          recursive: true
+        }
+      ),
+
+      mkdir(
+        chromiumProfileDirectory,
+        {
+          recursive: true
+        }
+      ),
+
+      mkdir(
+        chromiumCacheDirectory,
+        {
+          recursive: true
+        }
+      ),
+
+      mkdir(
+        chromiumConfigDirectory,
+        {
+          recursive: true
+        }
+      ),
+
+      mkdir(
+        chromiumTempDirectory,
+        {
+          recursive: true
+        }
+      )
+    ]);
 
     const indexPath =
       await extractPackage(
         zipBytes,
-        tempDirectory
+        siteDirectory
       );
 
-    browser = await puppeteer.launch({
-      args: [
-        ...chromium.args,
-        "--allow-file-access-from-files"
-      ],
-      defaultViewport: {
-        width,
-        height: 1200,
-        deviceScaleFactor:
-          scale
-      },
-      executablePath:
-        await chromium.executablePath(),
-      headless:
-        chromium.headless
-    });
+    const executablePath =
+      await chromium.executablePath();
 
-    const page =
+    browser =
+      await puppeteer.launch({
+        args: [
+          ...chromium.args,
+
+          "--allow-file-access-from-files",
+
+          /*
+           * Chromium이 디스크 캐시를 크게 만들지 않도록
+           * 캐시 기능을 최대한 제한합니다.
+           */
+          "--disable-application-cache",
+          "--disk-cache-size=0",
+          "--media-cache-size=0",
+
+          /*
+           * 혹시 생성되는 캐시도 모두
+           * 현재 요청의 작업 폴더 안으로 보냅니다.
+           */
+          `--disk-cache-dir=${chromiumCacheDirectory}`
+        ],
+
+        defaultViewport: {
+          width,
+          height: 1200,
+
+          /*
+           * 기존 저장 배율을 그대로 유지합니다.
+           * 기본값은 2배이므로 화질은 낮아지지 않습니다.
+           */
+          deviceScaleFactor:
+            scale
+        },
+
+        /*
+         * Chromium이 사용하는 HOME과 임시 경로를
+         * 현재 작업 폴더 내부로 강제합니다.
+         */
+        env: {
+          ...process.env,
+
+          HOME:
+            tempDirectory,
+
+          TMPDIR:
+            chromiumTempDirectory,
+
+          XDG_CACHE_HOME:
+            chromiumCacheDirectory,
+
+          XDG_CONFIG_HOME:
+            chromiumConfigDirectory
+        },
+
+        executablePath,
+
+        headless:
+          chromium.headless,
+
+        /*
+         * Chromium 사용자 프로필도 작업 폴더 내부에 생성합니다.
+         */
+        userDataDir:
+          chromiumProfileDirectory
+      });
+
+    page =
       await browser.newPage();
+
+    /*
+     * 페이지 단위 캐시도 비활성화합니다.
+     */
+    await page.setCacheEnabled(
+      false
+    );
 
     await page.setExtraHTTPHeaders({
       "Accept-Language":
@@ -429,7 +676,8 @@ export default async function handler(
     await page.setViewport({
       width,
       height: 1200,
-      deviceScaleFactor: scale
+      deviceScaleFactor:
+        scale
     });
 
     await page.goto(
@@ -441,10 +689,16 @@ export default async function handler(
           "domcontentloaded",
           "networkidle0"
         ],
-        timeout: 60_000
+
+        timeout:
+          60_000
       }
     );
 
+    /*
+     * 웹폰트와 업로드한 이미지가 모두 준비된 뒤
+     * PNG를 생성합니다.
+     */
     await page.evaluate(async () => {
       if (document.fonts) {
         await Promise.allSettled([
@@ -452,10 +706,12 @@ export default async function handler(
             '400 16px "Noto Sans KR"',
             "한글 漢字"
           ),
+
           document.fonts.load(
             '700 16px "Noto Sans KR"',
             "한글 漢字"
           ),
+
           document.fonts.load(
             '900 16px "Noto Sans KR"',
             "한글 漢字"
@@ -477,11 +733,18 @@ export default async function handler(
               await image.decode();
             }
           } catch {
-            // 깨진 선택 이미지가 있어도 나머지는 렌더링합니다.
+            /*
+             * 일부 이미지의 decode가 실패하더라도
+             * 전체 렌더링은 계속 진행합니다.
+             */
           }
         })
       );
 
+      /*
+       * 레이아웃 계산이 완전히 끝나도록
+       * 두 번의 프레임을 기다립니다.
+       */
       await new Promise((resolve) => {
         requestAnimationFrame(() => {
           requestAnimationFrame(
@@ -496,8 +759,11 @@ export default async function handler(
         "#captureArea",
         (element) => ({
           width: Math.ceil(
-            element.getBoundingClientRect().width
+            element
+              .getBoundingClientRect()
+              .width
           ),
+
           height: Math.ceil(
             element.scrollHeight
           )
@@ -505,7 +771,9 @@ export default async function handler(
       );
 
     await page.setViewport({
-      width: dimensions.width,
+      width:
+        dimensions.width,
+
       height: Math.max(
         900,
         Math.min(
@@ -513,7 +781,9 @@ export default async function handler(
           dimensions.height
         )
       ),
-      deviceScaleFactor: scale
+
+      deviceScaleFactor:
+        scale
     });
 
     await page.evaluate(
@@ -538,6 +808,13 @@ export default async function handler(
       );
     }
 
+    /*
+     * path 옵션을 사용하지 않고
+     * PNG 자체를 메모리 Buffer로 받습니다.
+     *
+     * 따라서 뒤에서 임시 폴더를 삭제해도
+     * 완성된 PNG는 사라지지 않습니다.
+     */
     const png =
       await target.screenshot({
         type: "png",
@@ -545,38 +822,98 @@ export default async function handler(
         captureBeyondViewport: true
       });
 
-    response.statusCode = 200;
+    const pngBuffer =
+      Buffer.isBuffer(png)
+        ? png
+        : Buffer.from(png);
+
+    response.statusCode =
+      200;
+
     response.setHeader(
       "Content-Type",
       "image/png"
     );
+
     response.setHeader(
       "Content-Disposition",
       'inline; filename="pair-archive.png"'
     );
+
     response.setHeader(
       "Cache-Control",
       "no-store"
     );
 
-    Readable.from(png).pipe(
-      response
+    response.setHeader(
+      "Content-Length",
+      String(
+        pngBuffer.byteLength
+      )
+    );
+
+    /*
+     * PNG 데이터가 메모리에 완성된 상태에서
+     * 사용자에게 바로 전송합니다.
+     */
+    response.end(
+      pngBuffer
     );
   } catch (error) {
     console.error(error);
 
     if (!response.headersSent) {
-      sendJson(response, 500, {
-        error:
-          error?.message ||
-          "Chromium 렌더링 중 오류가 발생했습니다."
-      });
+      sendJson(
+        response,
+        500,
+        {
+          error:
+            error?.message ||
+            "Chromium 렌더링 중 오류가 발생했습니다."
+        }
+      );
     } else {
       response.end();
     }
   } finally {
-    await browser?.close();
+    /*
+     * PNG 생성 성공 여부와 관계없이
+     * 페이지를 먼저 닫습니다.
+     */
+    if (page) {
+      try {
+        await page.close({
+          runBeforeUnload: false
+        });
+      } catch (error) {
+        console.warn(
+          "렌더 페이지를 닫지 못했습니다.",
+          error
+        );
+      }
+    }
 
+    /*
+     * Chromium 프로세스를 종료합니다.
+     * PNG 데이터는 이미 Buffer로 생성됐기 때문에
+     * 브라우저를 닫아도 다운로드에는 영향이 없습니다.
+     */
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (error) {
+        console.warn(
+          "Chromium을 종료하지 못했습니다.",
+          error
+        );
+      }
+    }
+
+    /*
+     * ZIP 압축 해제 파일, Chromium 프로필,
+     * 캐시, 설정, 임시 파일이 들어 있는
+     * 전체 작업 폴더를 삭제합니다.
+     */
     if (tempDirectory) {
       try {
         await rm(
@@ -588,12 +925,15 @@ export default async function handler(
         );
       } catch (error) {
         console.warn(
-          "임시 압축 해제 폴더를 정리하지 못했습니다.",
+          "임시 렌더 폴더를 정리하지 못했습니다.",
           error
         );
       }
     }
 
+    /*
+     * R2에 잠시 올려 둔 ZIP 파일도 삭제합니다.
+     */
     if (client && bucket) {
       try {
         await client.send(
