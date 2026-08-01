@@ -72,9 +72,10 @@ function requiredEnvironment() {
       .map(([key]) => key);
 
   if (missing.length) {
-    throw new Error(
-      "Vercel의 R2 환경변수가 완성되지 않았습니다."
-    );
+  throw new Error(
+    "누락된 R2 환경변수: " +
+    missing.join(", ")
+   );
   }
 
   return values;
